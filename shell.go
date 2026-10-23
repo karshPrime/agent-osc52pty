@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -8,12 +9,18 @@ import (
 	"os/exec"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/creack/pty"
 	"golang.org/x/term"
 )
 
-const bufferSize = 8 * 1024
+const (
+	bufferSize = 8 * 1024
+
+	// how long Wait waits for the shell's last output to be passed on after it exits
+	outputFlushTimeout = time.Second
+)
 
 type shell struct {
 	cmdLine     []string
@@ -22,6 +29,7 @@ type shell struct {
 	interceptor shellInterceptor
 	command     *exec.Cmd
 	ptmx        *os.File
+	outputDone  chan struct{}
 	cleanups    []func(*shell)
 }
 
@@ -77,7 +85,10 @@ func (s *shell) Wait() (_ int, returnedErr error) {
 		}
 	}()
 
-	if err := s.command.Wait(); err != nil {
+	err := s.command.Wait()
+	s.waitOutput()
+
+	if err != nil {
 		if exitError, ok := err.(*exec.ExitError); ok {
 			return exitError.ExitCode(), nil
 		}
@@ -86,6 +97,15 @@ func (s *shell) Wait() (_ int, returnedErr error) {
 	}
 
 	return 0, nil
+}
+
+// waitOutput waits, for at most outputFlushTimeout, until the output the shell
+// wrote before exiting has been read from the pty and passed on.
+func (s *shell) waitOutput() {
+	select {
+	case <-s.outputDone:
+	case <-time.After(outputFlushTimeout):
+	}
 }
 
 func (s *shell) createShellInterceptor(shellInterceptorFactory shellInterceptorFactory) error {
@@ -127,6 +147,7 @@ func (s *shell) startPTY() error {
 		return fmt.Errorf("start pty failed: %v", err)
 	}
 
+	s.outputDone = make(chan struct{})
 	s.cleanups = append(s.cleanups, func(s *shell) { s.ptmx.Close() })
 	return nil
 }
@@ -197,6 +218,7 @@ func (s *shell) pipeStdin() {
 
 func (s *shell) pipeStdout() {
 	go func() {
+		defer close(s.outputDone)
 		defer s.stdout.Close()
 		buffer := make([]byte, bufferSize)
 
@@ -204,7 +226,8 @@ func (s *shell) pipeStdout() {
 			n, err := s.ptmx.Read(buffer)
 
 			if err != nil {
-				if err == io.EOF {
+				// Linux reports EIO rather than EOF once the shell has exited
+				if err == io.EOF || errors.Is(err, syscall.EIO) {
 					return
 				}
 
